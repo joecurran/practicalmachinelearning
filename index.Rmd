@@ -1,23 +1,217 @@
 ---
-title: "machine learning course project"
+title: "model to predict quality of weight lifting"
 author: "joe curran"
-date: "Jan 27, 2016"
-output: html_document
+date: "Jan 31, 2016"
+output:
+  html_document:
+    keep_md: yes
 ---
 
-This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
+## Problem Statement
+The goal is to predict the manner of which a subject performed a given weight lifting excercise.  The data is from  
+http://groupware.les.inf.puc-rio.br/har (see the section on the Weight Lifting Exercise Dataset). Velloso, E. et al "Qualitative Activity Recognition of Weight Lifting Exercises"
 
-When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
+
+----
 
 
-```{r}
-summary(cars)
+## Strategy
+Strategy is to fit 4 different models: *rf, lda, gbm*, and then a stacked version using the 2 best models.  The model's prediction accurracy on the test set will be the estimate for the model's out of sample error.
+
+```{r init_setup, warning=FALSE, message=FALSE, echo=FALSE, include=FALSE}
+library(caret)
+
+#  Making use of multicore
+library(parallel)
+library(doParallel)
+detectCores()
+cluster <- makeCluster(4)
+registerDoParallel(cluster)
+
+set.seed(123456)
+
 ```
 
-You can also embed plots, for example:
+---
 
-```{r, echo=FALSE}
-plot(cars)
+
+
+## Model variable selection
+From the training data, we removed the following: username, timestamp columns since they were not intended to be  
+timeseries, and any column which had more than 10% NAs.  The resulting more dense set is 53 variables including  
+outcome variable. Further reduction of variables could be accomplished by ranking the variable importance  
+(*varImp*) of the fits and only taking the top influencing variables.  Since the computations were quick and 
+accuracy was fairly high, this optimization was not done at the cost of interpretability of model.
+
+```{r data_acquisition_and_pruning, echo=FALSE, include=FALSE, cache=TRUE}
+pml_testing = read.csv(file="~/Downloads/pml-testing.csv")
+pml_training = read.csv(file="~/Downloads/pml-training.csv")
+
+#Immediately the first 7 columns are not needed as 
+reduce_training<- subset(pml_training, select=c(-1,-2,-3,-4,-5,-6,-7)    )
+
+#remove to save space.
+rm(pml_training)
+
+# There are 153 variables left, of those we will only use numberics.
+# columns which are factor variables were likely inteneded to be numeric, 
+# but due to NAs and '#/DIV0', R turned them into factors. We ignore these factors
+using_columns <- c()
+for(varname in colnames(reduce_training)){
+  #p <- sprintf("varname=%s", varname)
+  #print(p)
+  
+  #be sure that outcome is part of training set
+  if(varname == "classe"){
+    using_columns = c(using_columns, varname)
+    next # skip to next column
+  }
+  
+  #Check if this is a variable of interest.
+  #if the column is not numeric, or there are 0 complete.cases or if the 
+  #percentage of complete cases < 0.9 then we should ignore this variable 
+  #from training data
+  if( 
+      (is.numeric(reduce_training[, varname]) == FALSE ) ||
+      (is.na(prop.table(table(complete.cases(reduce_training[, varname ])))["TRUE"]) || 
+      (as.numeric(prop.table(table(complete.cases(reduce_training[, varname ])))["TRUE"]) < 0.9) ) 
+        
+      ){
+        #Do nothing, ignore column
+  } 
+  else{
+    ##tmp<-sprintf("keeping %s", p)
+    ##print(tmp)
+    #append to columns we plan to use.
+    using_columns = c(using_columns, varname)
+  }
+}
+
+#We are now down to 53 variables from a somewhat densely populated dataset.
+final_training <- subset(reduce_training, select=using_columns)
+
+#remove to save space.
+rm(reduce_training)
+
 ```
 
-Note that the `echo = FALSE` parameter was added to the code chunk to prevent printing of the R code that generated the plot.
+---
+
+
+## Data Partitioning
+The training data is partitioned into 3 sets.  A training set and testing set for the single models, then another  
+validation set which will be used for out of sample error test of the stacked model. This is needed since the  
+testing set is used for model selection and therefore influences the stacked fit. 
+
+```{r data_paritioning, echo=FALSE , cache=TRUE, warning=FALSE, message=FALSE}
+# create the build, test and validation for model fit building, model fit testing
+# and stacked fit testing
+inBuild <- createDataPartition(final_training$classe , p=0.7, list=FALSE )
+validation <- final_training[-inBuild,] ; buildData<- final_training[inBuild,]
+inTrain <- createDataPartition(y=buildData$classe, p=0.7, list=FALSE)
+mod_training <- buildData[inTrain, ]; mod_testing <-buildData[-inTrain, ]
+```
+
+#### Partition breakdown
+```{r part_obs, echo=TRUE, cache=TRUE}
+partition_obs<-c(dim(mod_training)[1], dim(mod_testing)[1], dim(validation)[1] )
+partition_obs/sum(partition_obs)
+```
+
+---
+
+
+## Cross Validation, Model fit and Prediction
+Training can be tuned to use K-fold cross-validation via trainControl object.  We set the trainControl's  
+method = "cv" and number= 10 for 10-fold cross validation during training. We create the three models and  
+run the prediction on the testing set.  The out of sample error is given by the confusionMatrix accurracy.
+
+```{r model_fit_and_predict , echo=TRUE, message=FALSE, cache=TRUE}
+#as part of tain, we use 10-fold cross validation
+fitControl <- trainControl(method = "cv",
+                            number = 10,
+                            allowParallel = TRUE)
+
+#training rf, gbm, lda models
+system.time(mod_training_rf <- train(classe~., method="rf", data=mod_training, trControl=fitControl) )
+system.time(mod_training_lda <- train(classe~., method="lda", data=mod_training, trControl=fitControl))
+system.time(mod_training_gbm <- train(classe~., method="gbm", data=mod_training, trControl=fitControl))
+
+# we could further reduce the number of variables used by 
+# taking, for example, the top 20 of the 53 variables.  Since the models were not
+# computationaly expensive (a few mins), it is not down.
+
+# important_variables<-varImp(mod_training_rf)
+# important_lda_variables<-varImp(mod_training_lda)
+# important_gbm_variables <- varImp(mod_training_gbm)
+
+# predict using the models on the testing set
+pred_rf <- predict(mod_training_rf, newdata=mod_testing)
+pred_lda <- predict(mod_training_lda, newdata=mod_testing)
+pred_gbm <- predict(mod_training_gbm, newdata=mod_testing)
+
+```
+
+
+#### RF Confusion matrix
+```{r confusion_matrix_rf, echo=TRUE, include=TRUE}
+# find the potential out of sample error
+conf_rf<-confusionMatrix(table(actual=mod_testing$classe , pred_rf))
+conf_rf
+```
+
+
+#### LDA Confusion matrix
+```{r confusion_matrix_lda, echo=TRUE, include=TRUE}
+# find the potential out of sample error
+conf_lda<-confusionMatrix(table(actual=mod_testing$classe , pred_lda))
+conf_lda
+```
+
+
+#### GBM Confusion matrix
+```{r confusion_matrix_gbm, echo=TRUE, include=TRUE}
+# find the potential out of sample error
+conf_gbm<-confusionMatrix(table(actual=mod_testing$classe , pred_gbm))
+conf_gbm
+```
+
+### rf and gbm are best models
+rf model had the highest accurracy `r conf_rf$overall["Accuracy"]` followed by gbm `r conf_gbm$overall["Accuracy"]` and finally lda `r conf_lda$overall["Accuracy"]`.  We choose rf and gbm predictions for stacking using rf method on those predictions. 
+
+```{r stacked_fit , cache=TRUE,echo=FALSE, include=FALSE}
+# try to improve with a stacked model combining rf and gbm using rf method
+predDF<-data.frame(pred_rf, pred_gbm, classe=mod_testing$classe)
+combModFit <- train(classe~., method="rf", data=predDF)
+combPred <- predict(combModFit, predDF)
+confusionMatrix(table(actual=mod_testing$classe , combPred))
+
+pred_rf_V <- predict(mod_training_rf, validation); pred_gbm_V <- predict(mod_training_gbm, validation);
+pred_VDF <- data.frame(pred_rf=pred_rf_V, pred_gbm=pred_gbm_V)
+combPredV <- predict(combModFit, pred_VDF)
+```
+```{r stacked_accuracy, cache=TRUE, echo=TRUE}
+conf_stack<-confusionMatrix(table(actual=validation$classe , combPredV))
+conf_stack
+```
+
+### Stacking of gbm and rf does not improve prediction accurracy.
+The stacked model accuracy was `r conf_stack$overall["Accuracy"]` and therefore using the rf model is best.
+
+---
+
+##  Final prediction using rf model on testing set.
+Out of sample error less than 2% since accuracy of model is `r conf_rf$overall["Accuracy"]` on test data.
+
+```{r model_selected_and_predict, cache=TRUE}
+# from above results, the rf alone had the best model.
+# using rf for final analysis.
+pred_final_pml_testing<-predict(mod_training_rf, newdata=pml_testing)
+print(pred_final_pml_testing)
+
+```
+```{r stop_cluster, echo=FALSE}
+stopCluster(cluster)
+```
+
+
